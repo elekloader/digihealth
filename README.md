@@ -7,18 +7,29 @@ three rows to SETTINGS:
   processor's free on-chip SRAM instead of DDR. It is the same code, so the
   audio is identical, and the DSP load is lower. Measured on a unit, with
   the same song before and after:
-  - the render went from 537 to 480 Âµs a block;
+  - the render went from 537 to 480 µs a block;
   - DSP load went from 80.5 to 72.0 %.
 - **SYSTEM INFO** shows CPU, DSP, RAM and free sample memory in the top bar.
   A read-only USB diagnostics channel lets `tools/digiusb.py` read the same
   figures, and more, from a computer.
-- **REMOTE KEYS** (on at every power-on; Digitakt only for now) lets `tools/digiusb.py keys` press
+- **REMOTE KEYS** (on at every power-on) lets `tools/digiusb.py keys` press
   the panel's buttons over USB: see [Remote keys](#remote-keys). Off, the
   unit refuses key commands and lets go of any key the computer holds;
   the diagnostics still answer.
 
 On the **Digitone (mk1) and Digitone Keys**, OS 1.43 and 1.44, it is
 SYSTEM INFO alone (digihealth 1.1): see [The Digitone](#the-digitone).
+
+Experimental **Digitone II OS 1.12** support has run on a physical unit
+on the DN2 branch: [build, remote controls, screen readback and validation](dn2/README.md).
+It requires core-dn2 0.3. Its measurement branch adds relative CPU and raw SHARC handler spans over USB;
+1.5 also supports [optional L2 callback counters](dn2/DSP-METRICS.md), pending
+separate physical qualification. 1.6 reads DSP memory (`dsppeek`) through core-dn2 0.3's
+DSP peek. Its `dspbusy` command requires the optional
+[dspbusy-dn2 companion](https://github.com/simonjohansson/elekloader/tree/better-memory/mods/dspbusy-dn2)
+and a SHARC mod; without the companion it reports `no window yet`. The
+measure is time outside the DSP's idle task, not headroom. Total DSP load
+and FAST AUDIO are unavailable.
 
 It is an [elekloader](https://github.com/irpina/elekloader) mod.
 elekloader builds a custom OS file on your own machine, from your stock OS
@@ -86,8 +97,9 @@ KEYS turns the commands off: the unit then answers them with status 6 and
 yet keeps a mod's setting across power-off. The Digitone has no row yet,
 so its keys are always on: with core-dn1 4.1, a second SETTINGS row (any
 row, even a second SYSTEM INFO) stalls the first boot at FACTORY PROJECT
->> +DRIVE in digikit's emulator. Key protocol revision 2 is
-required; older clients/helpers refuse the capability mismatch before acting.
+>> +DRIVE in digikit's emulator. Key protocol revision 4 (revision 2 with
+encoder turns, for this Digitone port) is current for it, revision 3 is the Digitone II's, and revision 2
+is the Digitakt's; this client drives all three, and older clients/helpers refuse the capability mismatch before acting.
 Digitone OS 1.43 retains diagnostics only until its input bridge can be
 verified against that stock file. Digitone Keys extra controls are outside
 this map; the helper refuses that panel variant.
@@ -106,7 +118,7 @@ Firmware knows individual keys; the computer composes the gesture. A hold
 and tap may span different panel groups. To tap Settings on either device,
 use `keys SETTINGS`; `keys 'FUNC(LEVEL_PUSH)'` opens its Sound Browser.
 Numbered keys use the strings `1` through `16`. Encoder pushes use `A_PUSH`
-through `H_PUSH`; rotations are outside the button helper.
+through `H_PUSH`; for rotations, see [Encoder turns](#encoder-turns).
 
 Run multiple steps in one session with a comma-separated input:
 
@@ -145,6 +157,26 @@ deadlines are serviced by the UI task, so a stalled UI delays cleanup. A UI
 stall longer than the counter's roughly 32-second wrap can delay it further.
 Completion means the stock driver accepted the transition, not that a menu
 opened. See [the protocol reference](docs/REMOTE-KEYS.md).
+
+### Encoder turns
+
+On the desktop Digitone mk1 OS 1.44, `turn` turns encoders A-H and LEVEL as
+the panel does: the firmware hands the OS's encoder input one turn of
+`--step` counts a UI tick, so the OS's own acceleration applies. The Digitakt
+has no turns yet (its capabilities report no encoders).
+
+```bash
+python tools/digiusb.py turn A 8               # encoder A, 8 counts right
+python tools/digiusb.py turn LEVEL -4          # LEVEL, 4 counts left
+python tools/digiusb.py turn C 24 --step 4     # faster: 4 counts a tick
+python tools/digiusb.py turn A 2 --hold FUNC   # hold FUNC through the turn
+```
+
+A count is one wire unit of the panel's encoder messages, not a detent, and
+small turns need not move a parameter: the OS waits for a few counts before
+it steps, as it does for the panel's. With `--hold` the whole turn has to fit
+one action (30 ticks). From Python, `keys.turn('A', 8, step=1)` inside a
+`RemoteKeys` session.
 
 ## Test runner
 
