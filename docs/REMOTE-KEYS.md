@@ -1,4 +1,8 @@
-# Bounded key protocol, revision 2
+# Bounded key protocol, revisions 2, 3 and 4
+
+A build answers one revision: 2 (buttons only), 3 (Digitone II, TURN in detents) or
+4 (Digitone mk1 with encoders, TURN as a step per tick). The tables below are revision 2;
+the sections after them say what 3 and 4 change. `tools/digiusb.py` drives all three.
 
 Digitakt mk1 OS 1.53/1.54 and desktop Digitone mk1 OS 1.44. All messages use
 the existing DigiHealth USB-only SysEx channel; HELLO/STATS/PEEK and diagnostic
@@ -23,7 +27,7 @@ an exact decoded length, refusing truncated, oversized and noncanonical input.
 
 | Command | Arguments | Successful reply payload |
 |---|---|---|
-| `0x10 CAPABILITIES` | none | `u16 revision, u8 product, u8 OS_major, u8 OS_minor, u64 keys, u16 default_tap_ms, u16 max_tap_ms, u16 max_hold_ms` |
+| `0x10 CAPABILITIES` | none | `u16 revision, u8 product, u8 OS_major, u8 OS_minor, u64 keys, u16 default_tap_ms, u16 max_tap_ms, u16 max_hold_ms` (+ `u8 encoders` in revision 4) |
 | `0x11 OPEN` | `u32 session` | report |
 | `0x12 ACTION` | `u32 session, u32 operation, u8 action, u8 key, u16 duration_ms` | report |
 | `0x13 STATUS` | `u32 session, u32 operation` | report |
@@ -32,11 +36,16 @@ an exact decoded length, refusing truncated, oversized and noncanonical input.
 Capabilities: revision 2, product 1 (Digitakt mk1, OS 1.53/1.54) or 2
 (desktop Digitone mk1, OS 1.44). The 64-bit bitmap marks logical key ID minus
 one, with 48 bits set on Digitakt and 54 on Digitone. Default tap is 100 ms,
-maximum tap 250 ms and maximum press lease 2000 ms. The complete payload is
-19 bytes (`>HBBBQHHH`). The client validates revision, product/OS and bitmap
+maximum tap 250 ms and maximum press lease 2000 ms. The payload is 19 bytes
+(`>HBBBQHHH`). The client validates revision, product/OS, payload length and bitmap
 before OPEN, then refuses absent names before ACTION. A Digitone Keys panel
 is refused by the firmware using its board flag.
 
+Revision 4 (Digitone mk1 OS 1.44 with the encoder input) is revision 2 plus TURN and
+`u8 encoders`, the capability reply's last byte (20 bytes, `>HBBBQHHHB`): 9 on the
+desktop Digitone mk1 (A-H, then LEVEL). A port without the encoder input, and the
+Digitakt, still answer revision 2, 19 bytes, and refuse TURN. digiusb.py drives
+revisions 2, 3 and 4 and refuses a payload whose length does not match its revision.
 Revision 1 used smaller capability and ownership masks. Its clients reject
 the revision-2 capability reply before acting; revision-2 clients likewise
 refuse old helpers. ACTION arguments and FUNC/SRC IDs 1/2 are preserved.
@@ -50,7 +59,13 @@ u8 cleanup_pending` (19 bytes, `>IIBBQB`). States: 0 none, 1 accepted, 2 complet
 uses the logical capability mask. `cleanup_pending` is 0 or 1.
 
 Actions: 1 PRESS (1..2000 ms lease), 2 RELEASE (duration zero), 3 TAP
-(1..250 ms). The shared logical IDs and device maps are defined once in
+(1..250 ms), 4 TURN (revisions 3 and 4 only; its encoding differs, below). On
+revision 4 TURN's `key` is the encoder, 1..`encoders`, and its
+`duration` is a signed step (high byte, -30..30, not zero) and a tick count
+(low byte, 1..30): the UI tick hands the OS's encoder input one turn of that
+many counts, as the panel's receiver does, once a tick until the count is
+done; then the action completes. A turn owns no key. The client's `turn`
+splits larger turns into several actions. The shared logical IDs and device maps are defined once in
 `keys.def`, consumed by both C and Python. See [the button table](BUTTONS.md).
 The stock driver generates UI events and modifier/release suppression. No
 gesture or menu policy is encoded. The bridge supports groups 0..6; valid
@@ -102,10 +117,11 @@ DigiHealth. Released mk1 Elekloader core exports are unchanged.
 ## Digitone II extension (input revision 3)
 
 Product 3, OS 1.12 advertises revision 3 with the same 19-byte capability
-and report layouts. Its map is `dn2/keys.def`; do not infer names from the
-mk1 maps or firmware IDs. Existing devices keep revision 2 unchanged.
+and report layouts (no encoder-count byte; all nine encoders turn). Its map is `dn2/keys.def`; do not infer names from the
+mk1 maps or firmware IDs. Digitakt and mk1 builds without the encoder input keep revision 2 unchanged. A Digitone mk1 with the encoder input
+answers revision 4 (above): the same ACTION number, a different `duration` encoding, which is why it has its own revision.
 
-ACTION 4 is TURN: key is encoder 1..9, and the duration field is a signed
+On revision 3, ACTION 4 is TURN: key is encoder 1..9, and the duration field is a signed
 16-bit nonzero detent count in -30..30, encoded big-endian two's complement.
 It uses the same ordered operation, duplicate suppression, status recovery
 and disabled-input gate as buttons. The UI task alone calls the stock
