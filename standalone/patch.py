@@ -99,8 +99,9 @@ def tool_runner():
                      'in WSL on Windows)' % prefix)
 
 
-def build(cfg, defsym, image_end, work):
-    """Assemble, compile and link. -> (blob bytes at image_end, symbols, layout)."""
+def build(cfg, defsym, image_end, work, area):
+    """Assemble, compile and link, the code to run in `area` = (lo, hi), the device profile's
+    DDR area for mods. -> (blob bytes at image_end, symbols, layout)."""
     prefix, run, path = tool_runner()
     inc_dir = os.path.dirname(os.path.join(REPO, cfg['inc']))
     syms = dict(cfg['defsym'], RK_KEYS=1, **defsym)
@@ -122,7 +123,7 @@ def build(cfg, defsym, image_end, work):
         if run(argv, REPO).returncode:
             raise PatchError('building %s failed' % src)
         objs.append(obj)
-    lo, hi = 0x47BE0000, 0x47C00000
+    lo, hi = area
     ld = os.path.join(work, 'remote.ld')
     with open(ld, 'w') as f:
         f.write('''ENTRY(boot)
@@ -209,7 +210,7 @@ def patch(stock_path, out_path, version, elekloader, log=print):
     work = tempfile.mkdtemp(prefix='digiremote-', dir=os.path.join(REPO, 'out')
                             if os.path.isdir(os.path.join(REPO, 'out')) else None)
     try:
-        blob, symbols, layout = build(cfg, defsym, image_end, work)
+        blob, symbols, layout = build(cfg, defsym, image_end, work, tuple(dev.ddr))
     finally:
         if not os.environ.get('KEEP_WORK'):
             shutil.rmtree(work, ignore_errors=True)
