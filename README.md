@@ -7,7 +7,7 @@ three rows to SETTINGS:
   processor's free on-chip SRAM instead of DDR. It is the same code, so the
   audio is identical, and the DSP load is lower. Measured on a unit, with
   the same song before and after:
-  - the render went from 537 to 480 Âµs a block;
+  - the render went from 537 to 480 µs a block;
   - DSP load went from 80.5 to 72.0 %.
 - **SYSTEM INFO** shows CPU, DSP, RAM and free sample memory in the top bar.
   A read-only USB diagnostics channel lets `tools/digiusb.py` read the same
@@ -177,6 +177,42 @@ small turns need not move a parameter: the OS waits for a few counts before
 it steps, as it does for the panel's. With `--hold` the whole turn has to fit
 one action (30 ticks). From Python, `keys.turn('A', 8, step=1)` inside a
 `RemoteKeys` session.
+
+## Test runner
+
+`tools/digirun.py` drives a unit over one USB MIDI port for scripted checks:
+digihealth's keys (and encoder turns, where the build has them), screenshots,
+notes and CCs, and the data store, in one session, so a step can look at the
+screen while a key is held. Screenshots and the data store use Elektron's own
+RPC (`tools/elkrpc.py`, the channel Transfer uses), so they work on a stock OS
+too.
+
+```bash
+python tools/digirun.py info                          # Digitone (product id 0x14), OS 1.44
+python tools/digirun.py shot screen.png               # the screen now, 4x
+python tools/digirun.py do 'hold FUNC; shot held.png; release FUNC'
+python tools/digirun.py run steps.txt --out run1      # steps from a file
+python tools/digirun.py data ls /                     # the data store's roots
+```
+
+Steps: `tap`, `hold`, `release`, `keys SEQ` (as `digiusb.py keys`), `turn`,
+`shot FILE` (.png or the raw .bin framebuffer), `expect-screen NAME [S]`
+(compare with a saved .bin, saving the screen and a diff on a mismatch), `cc`,
+`nrpn`, `note`, `wait`, `stats`, `dump ADDR LEN FILE` and `say`; `python
+tools/digirun.py --help` lists their arguments. Writing to the data store is
+left out on purpose. On the Digitone, give a turn back a pause (`wait 3`)
+after a turn: one sent straight after was sometimes not taken. With both units connected, `--port Digitone` (before the
+command) picks one. `--port tcp:127.0.0.1:7311` talks to an emulator's USB MIDI
+link instead (digiemu's `tools/usbrun.py`), with no virtual MIDI ports.
+
+`send` takes only Digitone pattern, kit and sound dumps and requests for them
+(device byte 0x0D, ids 0x50-0x6F); anything else in the file is refused before
+a byte is sent. An optional local write policy (`tools/writepolicy.py`, a Python
+file the runner executes) is asked before `send`, `save-project` and renames. It
+is not asked before the key steps, which press the unit's own buttons, so it
+guards a plan's data steps and does not sandbox its key steps; `save-project`
+does check that the save landed in the slot it was given and that no other
+project's name or size changed. Names are used as given.
 
 ## The Digitone
 
