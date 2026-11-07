@@ -13,6 +13,7 @@
     python digiusb.py keys YES
     python digiusb.py keys 'FUNC(SRC)'
     python digiusb.py keys 'FUNC(SRC),DOWN,DOWN,DOWN,YES'
+    python digiusb.py turn E -12 [--step N] [--hold FUNC]   encoder E 12 counts left
 
 digihealth answers its own SysEx channel: Elektron's manufacturer header
 with a device byte (0x7D) no Elektron machine uses, so a stock OS drops the
@@ -46,6 +47,18 @@ STATUS = {0: 'ok', 1: 'refused', 2: 'unknown command', 3: 'busy',
 CAPS, OPEN, ACTION, KEY_STATUS, CANCEL = range(0x10, 0x15)
 PRESS, RELEASE, TAP, TURN = 1, 2, 3, 4
 FRAME = 0x15
+MAX_TURNS, MAX_STEP = 30, 30            # a mk1 TURN action: UI ticks, counts per tick
+MAX_DETENTS = 30                        # a Digitone II TURN action: detents either way
+# Encoders by the number TURN names them with, on every device that turns them: A-H are
+# 1-8 and LEVEL is 9. CAPS says how many a mk1 build turns (revision 4); a Digitone II
+# (revision 3) turns all nine; a revision 2 build has none.
+ENCODER_NAMES = ('A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'LEVEL')
+# The key helpers this client drives, by (revision, product, OS major, OS minor): the CAPS
+# payload's length. Revision 2: buttons (Digitakt 1.53/1.54, Digitone mk1 1.44). Revision 3:
+# Digitone II 1.12, TURN in signed detents. Revision 4: Digitone mk1 1.44 with encoders, TURN
+# as a step per tick and a tick count, and the encoder count appended to CAPS.
+HELPERS = {(2, 1, 1, 53): 19, (2, 1, 1, 54): 19, (2, 2, 1, 44): 19, (3, 3, 1, 12): 19,
+           (4, 2, 1, 44): 20}
 KEY_STATES = ('none', 'accepted', 'completed', 'cancelled', 'expired', 'failed')
 PEEK_MAX = 1024
 # PEEK reads DDR (cached view) and the 64 KB SRAM, and never the peripheral
@@ -352,15 +365,18 @@ class RemoteKeys:
     def __init__(self, diag):
         self.diag = diag
         payload = diag.call(req_caps)
-        if len(payload) != 19:
+        if len(payload) not in (19, 20):
             raise ValueError('invalid key capabilities')
-        revision, product, major, minor, keys, default, tap, hold = struct.unpack('>HBBBQHHH', payload)
-        if ((revision, product, major, minor) not in ((2, 1, 1, 53), (2, 1, 1, 54), (2, 2, 1, 44), (3, 3, 1, 12))
+        revision, product, major, minor, keys, default, tap, hold = struct.unpack_from('>HBBBQHHH', payload)
+        encoders = payload[19] if len(payload) == 20 else 9 if product == 3 else 0
+        if (HELPERS.get((revision, product, major, minor)) != len(payload)
                 or keys != SUPPORTED.get(product) or not 1 <= default <= tap <= 250
-                or not 1 <= hold <= 2000):
+                or not 1 <= hold <= 2000 or encoders > len(ENCODER_NAMES)
+                or (revision == 4 and not encoders)):
             raise ValueError('unsupported key helper, device, OS or limits')
         self.default_tap, self.max_tap, self.max_hold = default, tap, hold
-        self.product, self.supported = product, keys
+        self.product, self.supported, self.revision = product, keys, revision
+        self.encoders = {name: i + 1 for i, name in enumerate(ENCODER_NAMES[:encoders])}
         self.session = secrets.randbits(32) or 1
         self.operation = 0
         self._report(diag.call(req_open, self.session, timeout=0.25), 0)
@@ -403,12 +419,16 @@ class RemoteKeys:
             raise ValueError('invalid key duration')
         return self._action(action, (DN2_IDS if self.product == 3 else KEYS)[key], duration)
 
-    def turn(self, encoder, detents):
-        if self.product != 3 or not isinstance(encoder, int) or not 1 <= encoder <= 9:
-            raise ValueError('encoder control requires Digitone II and encoder 1..9')
-        if not isinstance(detents, int) or detents == 0 or not -30 <= detents <= 30:
-            raise ValueError('use -30..30 detents, excluding zero')
-        return self._action(TURN, encoder, detents & 0xffff)
+    def _encoder(self, encoder):
+        """A name (A-H, LEVEL) or number (1-9) -> the number TURN names it with."""
+        if isinstance(encoder, str):
+            number = self.encoders.get(encoder.upper())
+        else:
+            number = encoder if type(encoder) is int and encoder in self.encoders.values() else None
+        if number is None:
+            raise ValueError('unsupported encoder: this device turns %s'
+                             % (', '.join(self.encoders) or 'none'))
+        return number
 
     def _action(self, action, key, duration):
         self.operation += 1
@@ -431,6 +451,27 @@ class RemoteKeys:
 
     def tap(self, key, duration=None):
         return self.action(TAP, key, self.default_tap if duration is None else duration)
+
+    def turn(self, encoder, delta, step=1):
+        """Turn `encoder` (A-H or LEVEL, or 1-9) by `delta`: signed. A Digitone II takes
+        1..30 detents either way in one action (step must be 1). A Digitone mk1 takes
+        `delta` counts, `step` counts per UI tick, as TURN actions of up to MAX_TURNS ticks."""
+        number = self._encoder(encoder)
+        if not isinstance(delta, int) or isinstance(delta, bool) or not delta:
+            raise ValueError('use a nonzero integer delta')
+        if self.product == 3:
+            if step != 1 or abs(delta) > MAX_DETENTS:
+                raise ValueError('use -%d..%d detents, excluding zero (step 1)'
+                                 % (MAX_DETENTS, MAX_DETENTS))
+            return self._action(TURN, number, delta & 0xffff)
+        if not isinstance(step, int) or not 1 <= step <= MAX_STEP:
+            raise ValueError('use a step of 1..%d' % MAX_STEP)
+        sign, left = (1 if delta > 0 else -1), abs(delta)
+        while left:
+            size = min(step, left)
+            ticks = min(MAX_TURNS, left // size)
+            self._action(TURN, number, ((sign * size) & 0xFF) << 8 | ticks)
+            left -= size * ticks
 
     def cancel(self):
         try:
@@ -475,6 +516,39 @@ def key_args(args):
     if not 1 <= args.tap_ms <= 250 or not 1 <= args.hold_ms <= 2000:
         parser.error('use tap 1..250 ms and hold 1..2000 ms')
     return args
+
+
+def turn_args(args):
+    parser = argparse.ArgumentParser(
+        prog='digiusb.py turn',
+        description='Turn an encoder as the panel does: ENCODER is A-H or LEVEL; DELTA the '
+                    'counts (negative turns left).', allow_abbrev=False)
+    parser.add_argument('encoder', type=str.upper, choices=ENCODER_NAMES, metavar='ENCODER')
+    parser.add_argument('delta', type=int)
+    parser.add_argument('--step', type=int, default=1,
+                        help='counts per UI tick, 1..%d (default 1; larger is faster and '
+                             'meets the OS acceleration)' % MAX_STEP)
+    parser.add_argument('--hold', choices=sorted(KEY_NAMES), metavar='KEY',
+                        help='hold this key during the turn (e.g. FUNC)')
+    args = parser.parse_args(args)
+    if not args.delta or not 1 <= args.step <= MAX_STEP:
+        parser.error('use a nonzero DELTA and --step 1..%d' % MAX_STEP)
+    if args.hold and -(-abs(args.delta) // args.step) > MAX_TURNS:
+        parser.error('with --hold, a turn must fit one action (%d ticks): raise --step'
+                     % MAX_TURNS)
+    return args
+
+
+def cmd_turn(diag, args):
+    with RemoteKeys(diag) as keys:
+        if args.encoder not in keys.encoders or args.hold and args.hold not in MAPS[keys.product]:
+            raise ValueError('the connected device does not turn that encoder or have that button')
+        if args.hold:
+            keys.press(args.hold)
+        keys.turn(args.encoder, args.delta, args.step)
+        if args.hold:
+            keys.release(args.hold)
+    print('turn completed')
 
 
 def cmd_keys(diag, args):
@@ -695,17 +769,6 @@ def cmd_screen(diag, args):
     print('saved %s (frame %d)' % (args[0], generation))
 
 
-def cmd_turn(diag, args):
-    if len(args) != 2:
-        raise ValueError('use turn ENCODER DETENTS (A..H or LEVEL)')
-    names = {chr(65 + i): i + 1 for i in range(8)} | {'LEVEL': 9}
-    if args[0].upper() not in names:
-        raise ValueError('encoder must be A..H or LEVEL')
-    with RemoteKeys(diag) as keys:
-        keys.turn(names[args[0].upper()], int(args[1]))
-    print('encoder action completed')
-
-
 def selftest():
     sx = req_peek(7, 0x4020bb14, 20)
     assert sx[:6] == HEADER and all(b < 0x80 for b in sx[1:-1])
@@ -731,7 +794,8 @@ def selftest():
     print('selftest ok')
 
 
-COMMANDS = {'cfw': cmd_cfw, 'stats': cmd_stats, 'peek': cmd_peek, 'dump': cmd_dump, 'dsppeek': cmd_dsppeek, 'dspbusy': cmd_dspbusy, 'keys': cmd_keys, 'turn': cmd_turn, 'screen': cmd_screen}
+COMMANDS = {'cfw': cmd_cfw, 'stats': cmd_stats, 'peek': cmd_peek, 'dump': cmd_dump, 'dsppeek': cmd_dsppeek,
+            'dspbusy': cmd_dspbusy, 'keys': cmd_keys, 'turn': cmd_turn, 'screen': cmd_screen}
 
 
 def main(argv=None):
@@ -741,7 +805,8 @@ def main(argv=None):
         return
     if not argv or argv[0] not in COMMANDS:
         sys.exit(__doc__)
-    args = key_args(argv[1:]) if argv[0] == 'keys' else argv[1:]
+    args = (key_args(argv[1:]) if argv[0] == 'keys' else turn_args(argv[1:]) if argv[0] == 'turn'
+            else argv[1:])
     if sys.platform == 'win32':
         from winmidi import Port
     else:

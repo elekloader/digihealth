@@ -49,7 +49,7 @@ enum { MAX_HOLD_MS = 2000, MAX_TAP_MS = 250 };
 static unsigned session, operation, action, key, duration, state, reason;
 static unsigned char masks[CORE_KEYS_GROUPS];
 static unsigned held_key, held_start, held_ticks, tap_start;
-static unsigned started, tapping, cleanup, closed;
+static unsigned started, tapping, cleanup, closed, turns_left;
 
 static unsigned get32(const unsigned char *p)
 {
@@ -140,13 +140,18 @@ int rk_receive(const unsigned char *packed, unsigned length, unsigned char *repl
         return 4;
     }
     if (command == RK_CAPS) {
-        put16(reply + 4, RK_PRODUCT == 3 ? 3 : 2);
+        put16(reply + 4, RK_REVISION);
         reply[6] = RK_PRODUCT; reply[7] = 1; reply[8] = RK_OS_MINOR;
         bitmap(reply + 9, 1);
         put16(reply + 17, 100);
         put16(reply + 19, MAX_TAP_MS);
         put16(reply + 21, MAX_HOLD_MS);
+#if RK_ENCODERS && RK_PRODUCT != 3
+        reply[23] = RK_ENCODERS;       /* revision 4 only: the encoder count */
+        return 24;
+#else
         return 23;
+#endif
     }
     owner = get32(request + 3);
     sr = core_keys_lock();
@@ -176,13 +181,21 @@ int rk_receive(const unsigned char *packed, unsigned length, unsigned char *repl
         a = request[11]; k = request[12];
         ms = (unsigned)request[13] << 8 | request[14];
 #if RK_PRODUCT == 3
-        if (!number || (a == RK_TURN && RK_PRODUCT == 3
+        /* Digitone II (revision 3): TURN's key is encoder 1..9, its duration a signed detent count. */
+        if (!number || (a == RK_TURN
             ? k < 1 || k > 9 || !ms || (ms > 30 && ms < 65506)
             : k < 1 || k > RK_KEY_COUNT || !keymap[k].mask || a < RK_PRESS || a > RK_TAP ||
               (a == RK_RELEASE ? ms != 0 : !ms || ms > (a == RK_PRESS ? MAX_HOLD_MS : MAX_TAP_MS))))
 #else
-        if (!number || k < 1 || k > RK_KEY_COUNT || !keymap[k].mask || a < RK_PRESS || a > RK_TAP ||
-            (a == RK_RELEASE ? ms != 0 : !ms || ms > (a == RK_PRESS ? MAX_HOLD_MS : MAX_TAP_MS)))
+        /* mk1 with encoders (revision 4): TURN's key is encoder 1..RK_ENCODERS, its duration a
+         * signed step per tick << 8 | ticks. Without encoders TURN is refused (revision 2). */
+        if (!number || a < RK_PRESS || a > RK_TURN ||
+            (a == RK_TURN ? k < 1 || k > RK_ENCODERS || !(ms & 0xff) || (ms & 0xff) > RK_MAX_TURNS ||
+                            !(ms >> 8) || (signed char)(ms >> 8) > RK_MAX_STEP ||
+                            (signed char)(ms >> 8) < -RK_MAX_STEP
+                          : k < 1 || k > RK_KEY_COUNT || !keymap[k].mask ||
+                            (a == RK_RELEASE ? ms != 0
+                                             : !ms || ms > (a == RK_PRESS ? MAX_HOLD_MS : MAX_TAP_MS))))
 #endif
         {
             reply[3] = RK_INVALID;
@@ -197,6 +210,7 @@ int rk_receive(const unsigned char *packed, unsigned length, unsigned char *repl
         } else {
             operation = number; action = a; key = k; duration = ms;
             state = RK_ACCEPTED; reason = RK_OK; tapping = 0;
+            turns_left = a == RK_TURN ? ms & 0xff : 0;
             started = rk_now();
         }
     }
@@ -236,6 +250,19 @@ void rk_tick(void *ctrl)
             result = core_encoder_turn(key, (short)duration);
             if (result == CORE_KEYS_OK) state = RK_COMPLETED;
             else if (result != CORE_KEYS_BUSY) { state = RK_FAILED; reason = RK_INVALID; }
+            core_keys_unlock(sr);
+            return;
+        }
+#elif RK_ENCODERS
+        if (action == RK_TURN) {
+            /* One turn message a UI tick, so a burst arrives as the panel's do. */
+            result = core_encoder_turn(key - 1, (signed char)(duration >> 8));
+            if (result == CORE_KEYS_OK) {
+                if (!--turns_left) state = RK_COMPLETED;
+            } else if (result != CORE_KEYS_BUSY) {
+                state = RK_FAILED;
+                reason = RK_INVALID;
+            }
             core_keys_unlock(sr);
             return;
         }
