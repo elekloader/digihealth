@@ -410,9 +410,14 @@ class TcpPortTest(unittest.TestCase):
         self.assertTrue(self.got.endswith(bytes([0xB0, 74, 64])))
 
     def test_nothing_listening(self):
-        self.server.close()
+        import socket
+        # A port nothing listens on. (Closing self.server is not enough on Linux: the thread
+        # blocked in accept() keeps the listening socket alive, so the connection succeeds.)
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', 0))
+            port = probe.getsockname()[1]
         with self.assertRaisesRegex(OSError, 'cannot connect to tcp:'):
-            digirun.open_port(self.address)
+            digirun.open_port('tcp:127.0.0.1:%d' % port)
 
 
 class CommandTest(unittest.TestCase):
