@@ -425,7 +425,8 @@ class USBKeys(unittest.TestCase):
 
     def test_no_encoder_input_reports_none_and_refuses_turn(self):
         caps = self.diag.call(usb.req_caps)
-        self.assertEqual((len(caps), caps[19]), (20, 0))
+        # No encoder input: revision 2, the 19-byte reply every released client knows.
+        self.assertEqual((len(caps), struct.unpack_from('>H', caps)[0]), (19, 2))
         self.wire(usb.OPEN, struct.pack('>I', 7))
         self.assertEqual(self.wire(usb.ACTION, struct.pack('>IIBBH', 7, 1, usb.TURN, 1, 0x0101))
                          ['status'], 1)
@@ -444,6 +445,70 @@ class USBKeys(unittest.TestCase):
         keys = usb.RemoteKeys(types.SimpleNamespace(call=call))
         self.assertEqual(keys.encoders, {})
         keys.cancel()
+
+
+def caps_payload(revision, product, major, minor, length=19, encoders=9):
+    """A CAPS reply as a helper of that revision sends it."""
+    body = struct.pack('>HBBBQHHH', revision, product, major, minor, usb.SUPPORTED[product],
+                       100, 250, 2000)
+    return body + bytes([encoders]) if length == 20 else body
+
+
+class CapsRevisions(unittest.TestCase):
+    """The client drives revisions 2, 3 (Digitone II) and 4 (Digitone mk1 encoders), and
+    refuses a payload whose length does not match its revision."""
+
+    def keys(self, payload):
+        def call(builder, *args, **kwargs):
+            if builder == usb.req_caps:
+                return payload
+            return struct.pack('>IIBBQB', args[0], 0, 0, 0, 0, 0)   # OPEN: the session's report
+        return usb.RemoteKeys(types.SimpleNamespace(call=call))
+
+    def test_digitone_ii_revision_3_has_nine_named_encoders(self):
+        keys = self.keys(caps_payload(3, 3, 1, 12))
+        self.assertEqual(keys.encoders['A'], 1)
+        self.assertEqual(keys.encoders['LEVEL'], 9)
+        self.assertEqual(keys._encoder('b'), 2)
+        self.assertEqual(keys._encoder(9), 9)
+
+    def test_revision_2_has_no_encoders(self):
+        for ident in ((1, 1, 53), (1, 1, 54), (2, 1, 44)):
+            keys = self.keys(caps_payload(2, *ident))
+            self.assertEqual(keys.encoders, {})
+            with self.assertRaisesRegex(ValueError, 'unsupported encoder'):
+                keys.turn('A', 1)
+
+    def test_revision_4_is_the_mk1_with_encoders(self):
+        keys = self.keys(caps_payload(4, 2, 1, 44, 20, 9))
+        self.assertEqual(len(keys.encoders), 9)
+        self.assertEqual(keys.revision, 4)
+
+    def test_length_must_match_revision(self):
+        for revision, ident, length in ((4, (2, 1, 44), 19), (2, (2, 1, 44), 20),
+                                        (3, (3, 1, 12), 20), (2, (1, 1, 53), 20)):
+            with self.assertRaises(ValueError, msg=(revision, ident, length)):
+                self.keys(caps_payload(revision, *ident, length=length))
+
+    def test_revision_4_belongs_to_the_mk1_only(self):
+        for ident in ((1, 1, 53), (3, 1, 12), (2, 1, 43)):
+            with self.assertRaises(ValueError):
+                self.keys(caps_payload(4, *ident, length=20))
+        with self.assertRaises(ValueError):                   # no encoders at all
+            self.keys(caps_payload(4, 2, 1, 44, 20, 0))
+
+    def test_digitone_ii_turn_is_one_signed_action_of_detents(self):
+        keys = self.keys(caps_payload(3, 3, 1, 12))
+        sent = []
+        keys._action = lambda action, key, duration: sent.append((action, key, duration))
+        keys.turn('C', -3)
+        keys.turn(9, 30)
+        self.assertEqual(sent, [(usb.TURN, 3, 0xfffd), (usb.TURN, 9, 30)])
+        for args in (('C', 0), ('C', 31), ('C', -31), ('C', 2, 2), ('Z', 1), (0, 1), (10, 1),
+                     (True, 1)):
+            with self.assertRaises(ValueError, msg=args):
+                keys.turn(*args)
+        self.assertEqual(len(sent), 2)
 
 
 class USBTurns(unittest.TestCase):
@@ -469,10 +534,10 @@ class USBTurns(unittest.TestCase):
         self.port.send(usb.request(0xfedc, command, payload))
         return usb.parse(self.port.messages.pop())
 
-    def test_caps_report_revision_3_and_nine_encoders(self):
+    def test_caps_report_revision_4_and_nine_encoders(self):
         caps = self.diag.call(usb.req_caps)
         self.assertEqual(len(caps), 20)
-        self.assertEqual(struct.unpack_from('>HBBB', caps), (3, 2, 1, 44))
+        self.assertEqual(struct.unpack_from('>HBBB', caps), (4, 2, 1, 44))
         self.assertEqual(caps[19], 9)
         with usb.RemoteKeys(self.diag) as keys:
             self.assertEqual(sorted(keys.encoders.values()), list(range(1, 10)))
