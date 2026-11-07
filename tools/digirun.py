@@ -34,7 +34,8 @@ Steps (one per line or separated by ';'; '#' starts a comment):
     wait S
     stats                 one digihealth CPU/DSP/heap line
     dump ADDR LEN FILE    DDR to a file (digihealth)
-    send FILE             pattern, kit or sound dumps (a .syx) to the unit
+    send FILE             Digitone pattern, kit or sound dumps, or requests for them (a .syx),
+                          to the unit
     capture FILE S [any|none]  listen S seconds, then save every SysEx the unit sent
                           since the last send (or since this step) to FILE, the session's
                           own RPC and diagnostics traffic left out; FILE is written even
@@ -46,7 +47,12 @@ Steps (one per line or separated by ';'; '#' starts a comment):
     say TEXT              print TEXT
 
 send and save-project ask the local write policy first (writepolicy.py: the
-same policy file as analoghealth's), as data store writes do.
+same policy file as analoghealth's), as data store writes do. The key steps do
+not: they press the unit's buttons, so a policy cannot stop what the panel can
+do. save-project checks that the save landed in slot N and that no other
+project's name or size changed, and stops with an error if one did. send takes
+only Digitone pattern, kit and sound dumps (device 0x0D, ids 0x50-0x5F) and requests for
+them (ids 0x60-0x6F).
 
 Screenshots and the data store use Elektron's own RPC (elkrpc.py), which the
 stock OS answers. Key steps open a digihealth key session on first use and
@@ -55,6 +61,7 @@ only user of the port while it runs: close Transfer, Overbridge's MIDI and
 digiusb.py first.
 """
 import argparse
+import collections
 import json
 import os
 import shlex
@@ -106,13 +113,17 @@ def diff_png(w, h, diff):
 
 
 class Tap:
-    """The Port, keeping every SysEx that arrives so a dump sent while another
-    request waits for its reply is not lost."""
+    """The Port, keeping the Elektron dumps that arrive (not the RPC and diagnostics
+    traffic of the session's own requests) so a dump sent while another request waits for
+    its reply is not lost. `seen` keeps the latest SEEN_MAX; `since` is a list while a
+    capture step may be listening and grows only with what a capture would keep."""
+
+    SEEN_MAX = 1024
 
     def __init__(self, port):
         self.port = port
-        self.seen = []
-        self.since = None                # a list while a capture step is listening
+        self.seen = collections.deque(maxlen=self.SEEN_MAX)
+        self.since = None
 
     def send(self, data):
         self.port.send(data)
@@ -122,10 +133,14 @@ class Tap:
 
     def receive(self, seconds=1.0, until=None):
         msgs = self.port.receive(seconds, until)
-        self.seen.extend(msgs)
+        self.seen.extend(m for m in msgs if is_dump(m))
         if self.since is not None:
-            self.since.extend(msgs)
+            self.since.extend(m for m in msgs if m[:1] == b'\xF0' and not ours(m))
         return msgs
+
+    def drain(self, seconds=0.1):
+        """Read and drop what the unit has already sent, so a capture starts at its send."""
+        self.port.receive(seconds)
 
     def close(self):
         self.port.close()
@@ -177,6 +192,43 @@ def mark(s, path, name):
         raise unitdata.DataError('%s should be named %r but lists as %r' % (path, name, now))
 
 
+def split_steps(text):
+    """A script -> its steps: one per line or separated by ';', outside quotes. A '#' that
+    starts a word, outside quotes, begins a comment that runs to the end of the line (so a
+    ';' in a comment, or in a quoted `say 'a; b'`, does not start a step)."""
+    steps, cur, quote, word_start = [], [], None, True
+
+    def end():
+        step = ''.join(cur).strip()
+        if step:
+            steps.append(step)
+        cur.clear()
+    chars = iter(text)
+    for ch in chars:
+        if quote:
+            cur.append(ch)
+            if ch == quote:
+                quote = None
+            word_start = False
+        elif ch in ('"', "'"):
+            quote, word_start = ch, False
+            cur.append(ch)
+        elif ch == '#' and word_start:
+            for ch in chars:                  # a comment: skip to the end of the line
+                if ch == '\n':
+                    break
+            end()
+            word_start = True
+        elif ch in ';\n':
+            end()
+            word_start = True
+        else:
+            cur.append(ch)
+            word_start = ch.isspace()
+    end()
+    return steps
+
+
 class Session:
     unit = 'digitone'                    # for a write policy shared with analoghealth
 
@@ -194,7 +246,8 @@ class Session:
 
     def capture(self, keys=None, request=None, wait=30.0, quiet=1.0):
         """Start a dump (keys on the unit, or a raw request) and collect it: every
-        Elektron dump message until none has come for `quiet` s."""
+        Elektron dump message until none has come for `quiet` s. Not a step: it is for a
+        write policy's hooks and for a plan runner that imports this module."""
         self.port.seen.clear()
         if request:
             self.port.send(request)
@@ -315,8 +368,6 @@ class Session:
         elif op == 'keys':
             self.key_steps(' '.join(a))
         elif op == 'turn':
-            if not hasattr(self.keys, 'turn'):
-                raise ValueError('this digiusb.py has no encoder turns')
             self.keys.turn(a[0].upper(), num(a[1]), num(a[2]) if len(a) > 2 else 1)
         elif op == 'shot':
             s = self.shot(a[0])
@@ -353,9 +404,12 @@ class Session:
         elif op == 'send':
             # Pattern, kit and sound dumps land in the active project: the write policy is asked first
             msgs = load_syx(self.path(a[0]))
-            if not msgs or not all(is_dump(m) for m in msgs):
-                raise ValueError('%s holds messages other than Elektron dumps' % a[0])
+            if not msgs or not all(unitdata.is_kit_dump(m) or unitdata.is_dump_request(m)
+                                   for m in msgs):
+                raise ValueError('%s holds messages other than Digitone pattern, kit or sound '
+                                 'dumps and dump requests' % a[0])
             writepolicy.before_dumps(self, msgs)
+            self.port.drain()                # what came before is not a reply to this send
             self.port.since = []             # a capture step after this keeps the replies
             self.send_dump(msgs)
             say('  sent %d messages, %d bytes' % (len(msgs), sum(map(len, msgs))))
@@ -365,11 +419,12 @@ class Session:
             if want not in (None, 'any', 'none') or len(a) > 3:
                 raise ValueError('capture FILE S [any|none]')
             if self.port.since is None:
+                self.port.drain()
                 self.port.since = []
             end = time.monotonic() + float(a[1])
             while time.monotonic() < end:
                 self.port.receive(min(0.05, max(end - time.monotonic(), 0)))
-            got = [m for m in self.port.since if m[:1] == b'\xF0' and not ours(m)]
+            got = list(self.port.since)
             self.port.since = []             # the next capture keeps only what comes after
             save_syx(self.path(a[0]), got)
             say('  captured %d messages, %d bytes' % (len(got), sum(map(len, got))))
@@ -393,6 +448,8 @@ class Session:
             held, _ = unitdata.target(self.rpc, path)
             if held is not None:
                 raise unitdata.DataError('%s holds %r: save-project needs an empty slot' % (path, held))
+            before = unitdata.project_slots(self.rpc)
+            slot = int(path.rsplit('/', 1)[1])
             try:
                 self.key_steps(' '.join(a[2:]))
             except TimeoutError:
@@ -401,7 +458,14 @@ class Session:
             end = time.monotonic() + 120             # the emulator takes over a minute to write one
             while True:
                 try:
-                    if unitdata.target(self.rpc, path)[0] is not None:
+                    slots = unitdata.project_slots(self.rpc)
+                    elsewhere = sorted(i for i in set(slots) | set(before)
+                                       if i != slot and slots.get(i) != before.get(i))
+                    if elsewhere:
+                        raise unitdata.DataError(
+                            'the keys changed project slot%s %s, not only %d: check the unit'
+                            % ('s' if len(elsewhere) > 1 else '', ', '.join(map(str, elsewhere)), slot))
+                    if slots.get(slot):
                         break
                 except TimeoutError:
                     pass
@@ -435,12 +499,9 @@ class Session:
             raise ValueError('unknown step %r' % op)
 
     def run(self, text):
-        lines = [s for line in text.splitlines() if not line.strip().startswith('#')
-                 for s in line.split(';')]
-        for n, line in enumerate(lines, 1):
-            if line.strip() and not line.strip().startswith('#'):
-                say('%3d  %s' % (n, line.strip()))
-                self.step(line)
+        for n, line in enumerate(split_steps(text), 1):
+            say('%3d  %s' % (n, line))
+            self.step(line)
 
 
 def open_port(name=None):

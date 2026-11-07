@@ -70,7 +70,13 @@ def _body(dump, ids, what):
 
 def _renamed(dump, body, at, name):
     from digiusb import pack7
-    body[at:at + NAME_LEN] = name.encode('ascii').ljust(NAME_LEN, b'\0')[:NAME_LEN]
+    try:
+        raw = name.encode('ascii')
+    except UnicodeEncodeError:
+        raise DataError('%r: names are ASCII' % name)
+    if len(raw) > NAME_LEN:
+        raise DataError('%r is %d characters; a name is at most %d' % (name, len(raw), NAME_LEN))
+    body[at:at + NAME_LEN] = raw.ljust(NAME_LEN, b'\0')
     data = pack7(bytes(body))
     cs = sum(data) & 0x3FFF
     return dump[:10] + data + bytes([cs >> 7, cs & 0x7F]) + dump[-3:]
@@ -100,5 +106,19 @@ def renamed_kit_dump(dump, name):
 
 
 def is_kit_dump(msg):
-    """A pattern, kit or sound dump the unit stores in the active project when it receives it."""
-    return len(msg) > 7 and msg[:6] in DUMP_HEADERS and 0x50 <= msg[6] <= 0x5F
+    """A Digitone pattern, kit or sound dump (device byte 0x0D, ids 0x50-0x5F, a whole message):
+    what the unit stores in the active project when it receives it. Dump requests, other
+    Elektron devices' dumps and every other message are not."""
+    return len(msg) > 7 and msg[:6] in DUMP_HEADERS and 0x50 <= msg[6] <= 0x5F and msg[-1] == 0xF7
+
+
+def is_dump_request(msg):
+    """A Digitone dump request (device byte 0x0D, ids 0x60-0x6F, a whole message): the unit
+    answers it with a dump and changes nothing."""
+    return len(msg) > 7 and msg[:6] in DUMP_HEADERS and 0x60 <= msg[6] <= 0x6F and msg[-1] == 0xF7
+
+
+def project_slots(rpc):
+    """-> {slot id: (name, size)} of the stored projects, to see which slots a save touched."""
+    return {e['id']: (e['name'], e['size']) for e in rpc.data_list('/projects')
+            if e.get('id') is not None and not e.get('dir')}

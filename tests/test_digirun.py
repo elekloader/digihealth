@@ -111,6 +111,10 @@ class FakeUnit:
         if cmd == elkrpc.DATA_READ_CLOSE:
             job, = struct.unpack('>I', a)
             return b'\x01' + struct.pack('>II', job, 0)
+        if cmd == unitdata.DATA_RENAME:
+            path, name = a.split(b'\0')[:2]
+            self.names[path.decode()] = name.decode()
+            return b'\x01'
         return b''
 
 
@@ -265,6 +269,73 @@ class SessionTest(unittest.TestCase):
                 self.s.step('capture loud.syx 0.1 none')
         with self.assertRaisesRegex(ValueError, r'capture FILE S \[any\|none\]'):
             self.s.step('capture x.syx 1 some')
+
+    def test_send_takes_only_digitone_dumps_and_requests(self):
+        h = bytes([0xF0, 0x00, 0x20, 0x3C])
+        bad = {
+            'takt.syx': h + bytes([0x0C, 0x00, 0x53, 1, 1, 0, 1, 2, 0, 0, 0, 0xF7]),   # a Digitakt dump
+            'other.syx': h + bytes([0x0D, 0x00, 0x7F, 1, 2, 3, 0xF7]),                   # not a dump id
+            'rpc.syx': elkrpc.frame(1, elkrpc.PING),
+            'cut.syx': unitdata.DUMP_HEADER + bytes([0x53, 1, 1, 0, 1, 2]),              # no F7
+            'mixed.syx': unitdata.dump_request(unitdata.PATTERN_REQUEST, 0)
+                         + h + bytes([0x0D, 0x00, 0x7F, 1, 2, 3, 0xF7]),
+        }
+        for name, data in bad.items():
+            Path(self.tmp.name, name).write_bytes(data)
+            with self.assertRaisesRegex(ValueError, 'other than Digitone', msg=name):
+                self.s.step('send ' + name)
+        self.assertEqual(self.unit.dumps_in, [])
+        Path(self.tmp.name, 'good.syx').write_bytes(unitdata.dump_request(unitdata.PATTERN_REQUEST, 0))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.s.step('send good.syx')
+        self.assertEqual(len(self.unit.dumps_in), 1)
+
+    def test_steps_split_outside_quotes_and_comments(self):
+        steps = digirun.split_steps(
+            "# a; comment\ncc 1 2 3; say 'a; b' ;note 1 2 3  # kick; and more\n\nsay \"x # y\"; say a#b\n")
+        self.assertEqual(steps, ['cc 1 2 3', "say 'a; b'", 'note 1 2 3', 'say "x # y"', 'say a#b'])
+
+    def test_save_project_checks_where_the_save_landed(self):
+        unit, s = self.unit, self.s
+        with mock.patch.dict(os.environ, {'ANALOGHEALTH_POLICY': ''}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            s.key_steps = lambda seq: unit.store.__setitem__('/projects/7', b'x')   # the wrong slot
+            with self.assertRaisesRegex(unitdata.DataError, r'changed project slot 7, not only 5'):
+                s.step('save-project 5 Mine SAVE')
+            del unit.store['/projects/7']
+            s.key_steps = lambda seq: unit.store.__setitem__('/projects/1', b'overwritten')
+            with self.assertRaisesRegex(unitdata.DataError, r'changed project slot 1, not only 5'):
+                s.step('save-project 5 Mine SAVE')
+            unit.store['/projects/1'] = bytes(range(256)) * 50
+            s.key_steps = lambda seq: unit.store.__setitem__('/projects/5', b'saved')
+            s.step('save-project 5 Mine SAVE')
+        self.assertEqual(unit.names['/projects/5'], 'Mine')           # as asked, not upper-cased
+
+    def test_the_default_policy_keeps_the_name_as_asked(self):
+        with mock.patch.dict(os.environ, {'ANALOGHEALTH_POLICY': ''}):
+            self.assertEqual(writepolicy.check_write(None, '/projects/5', 'My Song'), 'My Song')
+            self.assertIsNone(writepolicy.check_write(None, '/projects/5', None))
+
+    def test_names_that_do_not_fit_are_refused(self):
+        p = make_pattern('IMAGINE')
+        self.assertEqual(unitdata.pattern_name(unitdata.renamed_pattern_dump(p, 'A' * 16)), 'A' * 16)
+        for name in ('A' * 17, 'caf\u00e9'):
+            with self.assertRaises(unitdata.DataError):
+                unitdata.renamed_pattern_dump(p, name)
+
+    def test_capture_starts_at_its_send(self):
+        Path(self.tmp.name, 'req.syx').write_bytes(unitdata.dump_request(unitdata.PATTERN_REQUEST, 0))
+        self.unit.pending.append(make_pattern('STALE'))       # sent before, not a reply
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.s.run('send req.syx; shot a.png; capture reply.syx 0.1 any')
+        self.assertEqual(digirun.load_syx(Path(self.tmp.name, 'reply.syx')), [self.unit.pattern])
+
+    def test_the_session_does_not_keep_its_own_traffic(self):
+        self.s.port.since = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(20):
+                self.s.step('shot a.bin')
+        self.assertEqual((self.s.port.since, list(self.s.port.seen)), ([], []))
 
     def test_ping_step(self):
         with contextlib.redirect_stdout(io.StringIO()) as out:

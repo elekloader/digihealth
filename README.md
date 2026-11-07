@@ -205,6 +205,15 @@ after a turn: one sent straight after was sometimes not taken. With both units c
 command) picks one. `--port tcp:127.0.0.1:7311` talks to an emulator's USB MIDI
 link instead (digiemu's `tools/usbrun.py`), with no virtual MIDI ports.
 
+`send` takes only Digitone pattern, kit and sound dumps and requests for them
+(device byte 0x0D, ids 0x50-0x6F); anything else in the file is refused before
+a byte is sent. An optional local write policy (`tools/writepolicy.py`, a Python
+file the runner executes) is asked before `send`, `save-project` and renames. It
+is not asked before the key steps, which press the unit's own buttons, so it
+guards a plan's data steps and does not sandbox its key steps; `save-project`
+does check that the save landed in the slot it was given and that no other
+project's name or size changed. Names are used as given.
+
 ## The Digitone
 
 digihealth 1.1 is SYSTEM INFO for the Digitone mk1 and Digitone Keys, OS

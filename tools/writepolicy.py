@@ -2,8 +2,20 @@
 """An optional write policy: a Python file installed on one computer that the
 runner asks before it changes anything on a unit, for example to keep
 automated test sessions away from the person's own projects. Without one, the
-runner writes wherever it is told and renames an item only when --name is
-given.
+runner writes wherever it is told and gives an item exactly the name it was
+asked for.
+
+What the policy covers, and what it does not. It is asked before the runner
+sends dumps (`send`), saves a project (`save-project`) and renames. It is not
+asked before the key steps (`tap`, `hold`, `release`, `keys`, `turn`): those
+press the unit's own buttons, and anything the panel can do, including saving
+over or deleting a project, they can do. A policy is a guard against mistakes
+in a test plan's data steps, not a sandbox for a plan's key steps. The runner
+does check where a `save-project` landed (see digirun.py).
+
+The runner executes the policy file: it is Python from this computer's config
+folder (or the file ANALOGHEALTH_POLICY names), so treat that folder like any
+other place code runs from.
 
 The policy is the file named by ANALOGHEALTH_POLICY (empty: none), else
 policy.py in the analoghealth config folder (%LOCALAPPDATA%\\analoghealth on
@@ -77,7 +89,7 @@ def check_write(rpc, path, new_name=None):
     hook = _hook('check_write')
     if hook:
         return hook(rpc, path, new_name)
-    return new_name.upper() if new_name else None
+    return new_name or None
 
 
 def before_dumps(session, msgs):
